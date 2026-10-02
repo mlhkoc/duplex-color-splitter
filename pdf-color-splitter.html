@@ -210,6 +210,21 @@ h1 {
 }
 .toast.show { opacity: 1; }
 [hidden] { display: none !important; }
+
+.addrow { display: flex; gap: 8px; }
+.addrow input { flex: 1; min-width: 0; }
+.btn.addbtn { width: auto; padding: 9px 14px; }
+.chips { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.chips li {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--sheet); border: 1px solid var(--line); border-radius: 999px;
+  padding: 3px 4px 3px 11px; font-size: 0.84rem;
+}
+.chips button {
+  border: 0; background: none; cursor: pointer; width: 22px; height: 22px; border-radius: 50%;
+  line-height: 1; font-size: 1rem; color: var(--ink-soft);
+}
+.chips button:hover { background: var(--line); color: var(--ink); }
 </style>
 </head>
 <body>
@@ -238,7 +253,17 @@ h1 {
     <div>
       <h1>Duplex Color Splitter</h1>
       <span class="reg" aria-hidden="true"></span>
-      <p class="lede">Click every page that needs color. Its whole sheet goes to the color printer, so both stacks interleave back into one double-sided document.</p>
+      <p class="lede">Pick the pages you want, then click every page that needs color. Its whole sheet goes to the color printer, so both stacks interleave back into one double-sided document.</p>
+    </div>
+
+    <div class="field">
+      <label for="cutin">Pages to print</label>
+      <div class="addrow">
+        <input id="cutin" type="text" placeholder="e.g. 45-78" autocomplete="off" disabled>
+        <button class="btn addbtn" id="cutadd" disabled>Add</button>
+      </div>
+      <ul class="chips" id="chips" aria-label="Pages to print"></ul>
+      <p class="hint" id="cuthint">Leave empty to print the whole document. Nothing is cut until you download.</p>
     </div>
 
     <div class="field">
@@ -372,6 +397,34 @@ h1 {
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
+  const T = {
+  notPdf: "That file isn't a PDF.",
+  passwordPdf: "This PDF is password-protected. Remove the password and try again.",
+  badPdf: "Couldn't open that PDF. It may be damaged.",
+  docMeta: (k, n, s, cut) => cut ? `${k} of ${n} pages, ${s} sheets` : `${n} pages, ${s} sheets`,
+  cutHint: "Leave empty to print the whole document. Nothing is cut until you download.",
+  cutBad: (bad, n) => `Not valid: ${bad.slice(0, 5).join(", ")}${bad.length > 5 ? "…" : ""} (this PDF has ${n} pages)`,
+  chip: (label, count) => count === 1 ? `Page ${label}` : `Pages ${label}`,
+  removeRange: (label) => `Remove ${label}`,
+  sheet: (s) => `Sheet ${s}`,
+  blankBack: "blank back",
+  specHint: "Click pages, or type numbers and ranges.",
+  specBad: (bad, n) => `Ignored: ${bad.slice(0, 5).join(", ")}${bad.length > 5 ? "…" : ""} (this PDF has ${n} pages)`,
+  specOutside: (spec) => `Not in the pages to print: ${spec}`,
+  pageAria: (p, st) => `Page ${p}, ${st === "on" ? "marked as color" : st === "ride" ? "printed in color with its other side" : "black and white"}`,
+  tagColor: "Color", tagBw: "B&W",
+  stripTitle: (s, pg, c) => `Sheet ${s} (pages ${pg}): ${c ? "color stack" : "B&W stack"}`,
+  checking: (i, k) => `Checking page ${i} of ${k}…`,
+  detected: (n, spec) => `Marked ${n} page${n > 1 ? "s" : ""} with color: ${spec}. Check them before printing.`,
+  detectedNone: "No pages with noticeable color found.",
+  detectError: "Color detection stopped because of an error.",
+  detect: "Find color pages automatically",
+  building: "Building PDF…",
+  pdfTitle: (name, color) => `${name} (${color ? "color" : "B&W"} pages)`,
+  saved: (file, pages, sheets) => `Saved ${file}: ${pages} pages on ${sheets} sheets.`,
+  buildError: "Couldn't build the PDF. The original may be damaged or encrypted.",
+  filePagePrefix: "p", fileExcerpt: "excerpt", fileColor: "color", fileBw: "bw",
+};
 
   // pdf.js worker from the inlined source so the app works offline and from file://
   try {
@@ -380,14 +433,54 @@ h1 {
   } catch (e) { console.warn("Worker setup failed, pdf.js will run on the main thread.", e); }
 
   const state = {
-    name: "", bytes: null, pdf: null, n: 0,
-    marked: new Set(),       // pages the user flagged as color (1-based)
-    pages: [],               // { el, canvas, rendered, ar }
+    name: "", bytes: null, pdf: null, n: 0, defaultAr: 0.7727,
+    ranges: [],          // added cut ranges [[a, b], ...] in original page numbers; empty = whole document
+    seq: [],             // pages to print, in order (original page numbers)
+    pos: new Map(),      // original page -> index in seq
+    marked: new Set(),   // pages flagged as color (original page numbers)
+    els: new Map(),      // original page -> page button element (current view)
+    cache: new Map(),    // original page -> { canvas, width } rendered thumbnails, reused across cuts
+    busy: new Set(),
   };
 
-  const sheetOf = (p) => Math.ceil(p / 2);
-  const pagesOnSheet = (s) => [2 * s - 1, 2 * s].filter((p) => p <= state.n);
-  const colorSheets = () => new Set([...state.marked].map(sheetOf));
+  // Sheets are pairs of consecutive pages in the *cut* document
+  const nSheets = () => Math.ceil(state.seq.length / 2);
+  const sheetOf = (p) => Math.floor(state.pos.get(p) / 2) + 1;
+  const pagesOnSheet = (s) => state.seq.slice(2 * s - 2, 2 * s);
+  const colorSheets = () => new Set([...state.marked].filter((p) => state.pos.has(p)).map(sheetOf));
+  const isCut = () => state.ranges.length > 0;
+
+  // ---------- Page lists ----------
+  function toSpec(pages) {
+    const a = [...new Set(pages)].sort((x, y) => x - y), out = [];
+    for (let i = 0; i < a.length; i++) {
+      let j = i;
+      while (j + 1 < a.length && a[j + 1] === a[j] + 1) j++;
+      out.push(j > i ? `${a[i]}-${a[j]}` : `${a[i]}`);
+      i = j;
+    }
+    return out.join(", ");
+  }
+
+  // Parses "3, 8-9 14" into ranges; reports anything invalid or outside 1..n
+  function parseRanges(str) {
+    const ranges = [], bad = [];
+    for (const raw of str.split(/[,;\s]+/).filter(Boolean)) {
+      const m = raw.match(/^(\d+)(?:[-–](\d+))?$/);
+      if (!m) { bad.push(raw); continue; }
+      let a = +m[1], b = m[2] ? +m[2] : a;
+      if (a > b) [a, b] = [b, a];
+      if (a < 1 || b > state.n) { bad.push(raw); continue; }
+      ranges.push([a, b]);
+    }
+    return { ranges, bad };
+  }
+
+  function setHint(id, msg, err) {
+    const h = $(id);
+    h.textContent = msg;
+    h.classList.toggle("err", !!err);
+  }
 
   // ---------- Loading ----------
   const drop = $("drop"), fileInput = $("file");
@@ -399,7 +492,7 @@ h1 {
   ["dragleave", "drop"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); if (t === "drop" || e.target === drop) drop.classList.remove("over"); }));
   document.addEventListener("drop", (e) => {
     const f = [...(e.dataTransfer?.files || [])].find((f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name));
-    if (f) load(f); else if (e.dataTransfer?.files?.length) toast("That file isn't a PDF.");
+    if (f) load(f); else if (e.dataTransfer?.files?.length) toast(T.notPdf);
   });
 
   async function load(file) {
@@ -407,56 +500,108 @@ h1 {
       const buf = new Uint8Array(await file.arrayBuffer());
       const pdf = await pdfjsLib.getDocument({ data: buf.slice() }).promise;
       if (state.pdf) state.pdf.destroy();
-      Object.assign(state, { name: file.name.replace(/\.pdf$/i, ""), bytes: buf, pdf, n: pdf.numPages, marked: new Set(), pages: [] });
+      const first = await pdf.getPage(1);
+      const vp = first.getViewport({ scale: 1 });
+      Object.assign(state, {
+        name: file.name.replace(/\.pdf$/i, ""), bytes: buf, pdf, n: pdf.numPages,
+        defaultAr: vp.width / vp.height, ranges: [], marked: new Set(), cache: new Map(), busy: new Set(),
+      });
       $("docname").textContent = file.name;
-      $("docmeta").textContent = `${state.n} pages, ${Math.ceil(state.n / 2)} sheets`;
       drop.hidden = true; $("doc").hidden = false;
-      ["spec", "detect", "clear"].forEach((id) => ($(id).disabled = false));
-      $("spec").value = "";
-      await buildSheets();
-      update();
+      ["spec", "detect", "clear", "cutin", "cutadd"].forEach((id) => ($(id).disabled = false));
+      $("spec").value = ""; $("cutin").value = "";
+      setHint("spechint", T.specHint); setHint("cuthint", T.cutHint);
+      applyCut();
     } catch (err) {
       console.error(err);
-      toast(err?.name === "PasswordException" ? "This PDF is password-protected. Remove the password and try again." : "Couldn't open that PDF. It may be damaged.");
+      toast(err?.name === "PasswordException" ? T.passwordPdf : T.badPdf);
     }
+  }
+
+  // ---------- Cutting ----------
+  function applyCut() {
+    const inc = new Set();
+    if (isCut()) for (const [a, b] of state.ranges) for (let p = a; p <= b; p++) inc.add(p);
+    else for (let p = 1; p <= state.n; p++) inc.add(p);
+    state.seq = [...inc].sort((x, y) => x - y);
+    state.pos = new Map(state.seq.map((p, i) => [p, i]));
+
+    // Color marks only make sense for pages that are printed
+    const before = state.marked.size;
+    state.marked = new Set([...state.marked].filter((p) => state.pos.has(p)));
+    if (state.marked.size !== before) { $("spec").value = toSpec(state.marked); setHint("spechint", T.specHint); }
+
+    const m = T.docMeta(state.seq.length, state.n, nSheets(), isCut());
+    $("docmeta").textContent = m;
+    renderChips();
+    buildSheets();
+    update();
+  }
+
+  function addCut() {
+    const input = $("cutin");
+    const { ranges, bad } = parseRanges(input.value);
+    if (bad.length) { setHint("cuthint", T.cutBad(bad, state.n), true); return; }
+    if (!ranges.length) return;
+    state.ranges.push(...ranges);
+    input.value = "";
+    setHint("cuthint", T.cutHint);
+    applyCut();
+    window.scrollTo({ top: 0 });
+  }
+  $("cutadd").addEventListener("click", addCut);
+  $("cutin").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addCut(); } });
+  $("cutin").addEventListener("input", () => { if ($("cuthint").classList.contains("err")) setHint("cuthint", T.cutHint); });
+
+  function renderChips() {
+    const ul = $("chips"); ul.innerHTML = "";
+    state.ranges.forEach(([a, b], i) => {
+      const li = document.createElement("li");
+      const label = a === b ? `${a}` : `${a}–${b}`;
+      li.innerHTML = `<span></span><button type="button">×</button>`;
+      li.querySelector("span").textContent = T.chip(label, b - a + 1);
+      const x = li.querySelector("button");
+      x.setAttribute("aria-label", T.removeRange(label));
+      x.addEventListener("click", () => { state.ranges.splice(i, 1); applyCut(); });
+      ul.appendChild(li);
+    });
+    ul.hidden = !state.ranges.length;
   }
 
   // ---------- Rendering ----------
   let observer;
-  async function buildSheets() {
+  function buildSheets() {
     const wrap = $("sheets"); wrap.innerHTML = "";
-    const first = await state.pdf.getPage(1);
-    const vp = first.getViewport({ scale: 1 });
-    const defaultAr = vp.width / vp.height;
+    state.els = new Map();
     observer?.disconnect();
     observer = new IntersectionObserver((entries) => {
       for (const en of entries) if (en.isIntersecting) renderPage(+en.target.dataset.p);
     }, { rootMargin: "600px 0px" });
 
-    const sheets = Math.ceil(state.n / 2);
     const frag = document.createDocumentFragment();
-    for (let s = 1; s <= sheets; s++) {
+    for (let s = 1; s <= nSheets(); s++) {
       const sw = document.createElement("div");
       sw.className = "sheetwrap"; sw.id = `sheet-${s}`;
-      sw.innerHTML = `<div class="sheetlabel"><span>Sheet ${s}</span><span class="tag">B&amp;W</span></div>`;
+      sw.innerHTML = `<div class="sheetlabel"><span>${T.sheet(s)}</span><span class="tag"></span></div>`;
       const sheet = document.createElement("div"); sheet.className = "sheet";
-      for (const p of [2 * s - 1, 2 * s]) {
-        if (p > state.n) {
-          const e = document.createElement("div");
-          e.className = "page empty"; e.style.setProperty("--ar", defaultAr);
-          e.innerHTML = "<span>blank back</span>";
-          sheet.appendChild(e); continue;
-        }
+      const pages = pagesOnSheet(s);
+      for (const p of pages) {
         const b = document.createElement("button");
         b.className = "page"; b.dataset.p = p; b.type = "button";
-        b.style.setProperty("--ar", defaultAr);
-        b.setAttribute("aria-pressed", "false");
-        b.setAttribute("aria-label", `Page ${p}`);
-        b.innerHTML = `<span class="spin">${p}</span><span class="pnum">${p}</span>`;
+        const cached = state.cache.get(p);
+        b.style.setProperty("--ar", cached?.ar || state.defaultAr);
+        b.innerHTML = `<span class="pnum">${p}</span>`;
+        if (cached) b.prepend(cached.canvas); else b.insertAdjacentHTML("afterbegin", `<span class="spin">${p}</span>`);
         b.addEventListener("click", () => toggle(p));
-        state.pages[p] = { el: b, rendered: 0, busy: false };
+        state.els.set(p, b);
         observer.observe(b);
         sheet.appendChild(b);
+      }
+      if (pages.length === 1) {
+        const e = document.createElement("div");
+        e.className = "page empty"; e.style.setProperty("--ar", state.defaultAr);
+        e.innerHTML = `<span>${T.blankBack}</span>`;
+        sheet.appendChild(e);
       }
       sw.appendChild(sheet);
       frag.appendChild(sw);
@@ -465,12 +610,13 @@ h1 {
   }
 
   async function renderPage(p) {
-    const rec = state.pages[p];
-    if (!rec || rec.busy) return;
-    const cssW = rec.el.clientWidth || 300;
+    const el = state.els.get(p);
+    if (!el || state.busy.has(p)) return;
+    const cssW = el.clientWidth || 300;
     const target = Math.round(cssW * Math.min(window.devicePixelRatio || 1, 2.5));
-    if (rec.rendered >= target * 0.95) return;
-    rec.busy = true;
+    const cached = state.cache.get(p);
+    if (cached && cached.width >= target * 0.95) return;
+    state.busy.add(p);
     try {
       const page = await state.pdf.getPage(p);
       const base = page.getViewport({ scale: 1 });
@@ -478,13 +624,17 @@ h1 {
       const canvas = document.createElement("canvas");
       canvas.width = Math.round(vp.width); canvas.height = Math.round(vp.height);
       await page.render({ canvasContext: canvas.getContext("2d", { alpha: false }), viewport: vp }).promise;
-      rec.el.style.setProperty("--ar", base.width / base.height);
-      rec.el.querySelector("canvas")?.remove();
-      rec.el.querySelector(".spin")?.remove();
-      rec.el.prepend(canvas);
-      rec.rendered = target;
+      const ar = base.width / base.height;
+      state.cache.set(p, { canvas, width: target, ar });
+      const cur = state.els.get(p); // the view may have been rebuilt while rendering
+      if (cur) {
+        cur.style.setProperty("--ar", ar);
+        cur.querySelector("canvas")?.remove();
+        cur.querySelector(".spin")?.remove();
+        cur.prepend(canvas);
+      }
     } catch (e) { console.error(e); }
-    rec.busy = false;
+    state.busy.delete(p);
   }
 
   // Size is relative to the workspace width (CSS container units); the slider sets
@@ -494,9 +644,9 @@ h1 {
   function rerenderVisible() {
     clearTimeout(zt);
     zt = setTimeout(() => {
-      for (let p = 1; p <= state.n; p++) {
-        const r = state.pages[p]?.el.getBoundingClientRect();
-        if (r && r.bottom > -600 && r.top < innerHeight + 600) renderPage(p);
+      for (const [p, el] of state.els) {
+        const r = el.getBoundingClientRect();
+        if (r.bottom > -600 && r.top < innerHeight + 600) renderPage(p);
       }
     }, 200);
   }
@@ -506,93 +656,68 @@ h1 {
   });
   window.addEventListener("resize", rerenderVisible);
 
-  // ---------- Selection ----------
+  // ---------- Color selection ----------
   function toggle(p) {
     state.marked.has(p) ? state.marked.delete(p) : state.marked.add(p);
     $("spec").value = toSpec(state.marked);
-    setHint();
+    setHint("spechint", T.specHint);
     update();
   }
 
-  function toSpec(set) {
-    const a = [...set].sort((x, y) => x - y), out = [];
-    for (let i = 0; i < a.length; i++) {
-      let j = i;
-      while (j + 1 < a.length && a[j + 1] === a[j] + 1) j++;
-      out.push(j > i ? `${a[i]}-${a[j]}` : `${a[i]}`);
-      i = j;
-    }
-    return out.join(", ");
-  }
-
-  function parseSpec(str) {
-    const set = new Set(), bad = [];
-    for (const raw of str.split(/[,;\s]+/).filter(Boolean)) {
-      const m = raw.match(/^(\d+)(?:-(\d+))?$/);
-      if (!m) { bad.push(raw); continue; }
-      let a = +m[1], b = m[2] ? +m[2] : a;
-      if (a > b) [a, b] = [b, a];
-      for (let p = a; p <= b; p++) (p >= 1 && p <= state.n ? set.add(p) : bad.push(String(p)));
-    }
-    return { set, bad: [...new Set(bad)] };
-  }
-
-  function setHint(msg, err) {
-    const h = $("spechint");
-    h.textContent = msg || "Click pages, or type numbers and ranges.";
-    h.classList.toggle("err", !!err);
-  }
-
   $("spec").addEventListener("input", (e) => {
-    const { set, bad } = parseSpec(e.target.value);
+    const { ranges, bad } = parseRanges(e.target.value);
+    const set = new Set(), outside = [];
+    for (const [a, b] of ranges) for (let p = a; p <= b; p++) (state.pos.has(p) ? set.add(p) : outside.push(p));
     state.marked = set;
-    if (bad.length) setHint(`Ignored: ${bad.slice(0, 5).join(", ")}${bad.length > 5 ? "…" : ""} (this PDF has ${state.n} pages)`, true);
-    else setHint();
+    if (bad.length) setHint("spechint", T.specBad(bad, state.n), true);
+    else if (outside.length) setHint("spechint", T.specOutside(toSpec(outside)), true);
+    else setHint("spechint", T.specHint);
     update();
   });
   $("spec").addEventListener("blur", (e) => { if (!$("spechint").classList.contains("err")) e.target.value = toSpec(state.marked); });
 
-  $("clear").addEventListener("click", () => { state.marked.clear(); $("spec").value = ""; setHint(); update(); });
+  $("clear").addEventListener("click", () => { state.marked.clear(); $("spec").value = ""; setHint("spechint", T.specHint); update(); });
 
   function update() {
     const cs = colorSheets();
-    const total = Math.ceil(state.n / 2);
-    for (let p = 1; p <= state.n; p++) {
-      const el = state.pages[p]?.el; if (!el) continue;
+    const total = nSheets();
+    for (const [p, el] of state.els) {
       const on = state.marked.has(p), ride = !on && cs.has(sheetOf(p));
       el.classList.toggle("on", on); el.classList.toggle("ride", ride);
       el.setAttribute("aria-pressed", String(on));
-      el.setAttribute("aria-label", `Page ${p}, ${on ? "marked as color" : ride ? "printed in color with its other side" : "black and white"}`);
+      el.setAttribute("aria-label", T.pageAria(p, on ? "on" : ride ? "ride" : "bw"));
     }
     const strip = $("strip"); strip.innerHTML = "";
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     for (let s = 1; s <= total; s++) {
       const c = cs.has(s);
-      document.getElementById(`sheet-${s}`)?.querySelector(".sheet")?.classList.toggle("c", c);
-      const tag = document.getElementById(`sheet-${s}`)?.querySelector(".tag");
-      if (tag) { tag.textContent = c ? "Color" : "B&W"; tag.classList.toggle("c", c); }
+      const sw = document.getElementById(`sheet-${s}`);
+      sw?.querySelector(".sheet")?.classList.toggle("c", c);
+      const tag = sw?.querySelector(".tag");
+      if (tag) { tag.textContent = c ? T.tagColor : T.tagBw; tag.classList.toggle("c", c); }
       const b = document.createElement("button");
       b.type = "button"; if (c) b.className = "c";
-      const pg = pagesOnSheet(s).join("–");
-      b.title = `Sheet ${s} (pages ${pg}): ${c ? "color stack" : "B&W stack"}`;
+      b.title = T.stripTitle(s, pagesOnSheet(s).join("–"), c);
       b.setAttribute("aria-label", b.title);
-      b.addEventListener("click", () => document.getElementById(`sheet-${s}`)?.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" }));
+      b.addEventListener("click", () => sw?.scrollIntoView({ behavior: reduce ? "auto" : "smooth" }));
       strip.appendChild(b);
     }
     $("ncolor").textContent = cs.size;
     $("nbw").textContent = total - cs.size;
     $("dlcolor").disabled = cs.size === 0;
-    $("dlbw").disabled = total - cs.size === 0 || !state.pdf;
+    $("dlbw").disabled = total - cs.size === 0;
   }
 
-  // ---------- Automatic color detection ----------
+  // ---------- Automatic color detection (only the pages to print) ----------
   $("detect").addEventListener("click", async () => {
     const btn = $("detect"); btn.disabled = true;
     const found = [];
     try {
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d", { willReadFrequently: true, alpha: false });
-      for (let p = 1; p <= state.n; p++) {
-        btn.textContent = `Checking page ${p} of ${state.n}…`;
+      for (let i = 0; i < state.seq.length; i++) {
+        const p = state.seq[i];
+        btn.textContent = T.checking(i + 1, state.seq.length);
         const page = await state.pdf.getPage(p);
         const base = page.getViewport({ scale: 1 });
         const vp = page.getViewport({ scale: 200 / base.width });
@@ -601,8 +726,8 @@ h1 {
         await page.render({ canvasContext: ctx, viewport: vp }).promise;
         const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
         let colored = 0;
-        for (let i = 0; i < d.length; i += 4) {
-          const mx = Math.max(d[i], d[i + 1], d[i + 2]), mn = Math.min(d[i], d[i + 1], d[i + 2]);
+        for (let k = 0; k < d.length; k += 4) {
+          const mx = Math.max(d[k], d[k + 1], d[k + 2]), mn = Math.min(d[k], d[k + 1], d[k + 2]);
           if (mx - mn > 48) colored++;
         }
         // Ignore pages where color is only a few hyperlinks or a tiny logo
@@ -611,36 +736,44 @@ h1 {
       }
       found.forEach((p) => state.marked.add(p));
       $("spec").value = toSpec(state.marked);
-      setHint(); update();
-      toast(found.length ? `Marked ${found.length} page${found.length > 1 ? "s" : ""} with color: ${toSpec(new Set(found))}. Check them before printing.` : "No pages with noticeable color found.");
-    } catch (e) { console.error(e); toast("Color detection stopped because of an error."); }
-    btn.textContent = "Find color pages automatically"; btn.disabled = false;
+      setHint("spechint", T.specHint); update();
+      toast(found.length ? T.detected(found.length, toSpec(found)) : T.detectedNone);
+    } catch (e) { console.error(e); toast(T.detectError); }
+    btn.textContent = T.detect; btn.disabled = false;
   });
 
   // ---------- Export ----------
+  function outName(kind) {
+    let part = "";
+    if (isCut()) {
+      const spec = toSpec(state.seq).replace(/, /g, "_");
+      part = spec.length <= 24 ? `_${T.filePagePrefix}${spec}` : `_${T.fileExcerpt}`;
+    }
+    return `${state.name}${part}_${kind === "color" ? T.fileColor : T.fileBw}.pdf`;
+  }
+
   async function exportPdf(kind) {
     const cs = colorSheets();
-    const total = Math.ceil(state.n / 2);
     const pages = [];
-    for (let s = 1; s <= total; s++) if (cs.has(s) === (kind === "color")) pages.push(...pagesOnSheet(s));
+    for (let s = 1; s <= nSheets(); s++) if (cs.has(s) === (kind === "color")) pages.push(...pagesOnSheet(s));
     if (!pages.length) return;
     const btn = $(kind === "color" ? "dlcolor" : "dlbw");
-    const label = btn.innerHTML; btn.disabled = true; btn.textContent = "Building PDF…";
+    const label = btn.innerHTML; btn.disabled = true; btn.textContent = T.building;
     try {
       const { PDFDocument } = PDFLib;
       const src = await PDFDocument.load(state.bytes, { ignoreEncryption: true });
       const out = await PDFDocument.create();
       const copied = await out.copyPages(src, pages.map((p) => p - 1));
       copied.forEach((pg) => out.addPage(pg));
-      out.setTitle(`${state.name} (${kind === "color" ? "color" : "B&W"} pages)`);
+      out.setTitle(T.pdfTitle(state.name, kind === "color"));
       const blob = new Blob([await out.save()], { type: "application/pdf" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `${state.name}_${kind === "color" ? "color" : "bw"}.pdf`;
+      a.download = outName(kind);
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-      toast(`Saved ${a.download}: ${pages.length} pages on ${Math.ceil(pages.length / 2)} sheets.`);
-    } catch (e) { console.error(e); toast("Couldn't build the PDF. The original may be damaged or encrypted."); }
+      toast(T.saved(a.download, pages.length, Math.ceil(pages.length / 2)));
+    } catch (e) { console.error(e); toast(T.buildError); }
     btn.innerHTML = label; update();
   }
   $("dlcolor").addEventListener("click", () => exportPdf("color"));
